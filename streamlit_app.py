@@ -135,6 +135,13 @@ if uploaded_file is not None:
             # Create a dictionary to store vehicle presence at each stop
             stop_presence = {stop: [] for stop in all_stops}
             
+            # Define buffer time in minutes (2.5 minutes as requested)
+            BUFFER_MINUTES = 2.5
+            
+            # First, track all arrivals and departures for each vehicle
+            arrivals = {}  # Dictionary to store arrivals by vehicle and stop
+            departures = {}  # Dictionary to store departures by vehicle and stop
+            
             # Process each relief vehicle separately
             for vehicle in df['Relief Vehicle'].unique():
                 # Get trips for this vehicle and sort by start time
@@ -146,43 +153,172 @@ if uploaded_file is not None:
                     next_trips = vehicle_df[vehicle_df['Start Time'] > current_trip['End Time']].sort_values('Start Time')
                     next_trip = next_trips.iloc[0] if not next_trips.empty else None
                     
-                    # Case 1: Vehicle arrives at a destination
+                    # ---- Track departure from origin ----
+                    if not pd.isna(current_trip['Origin']) and not pd.isna(current_trip['Start Time']):
+                        origin = current_trip['Origin']
+                        start_time = current_trip['Start Time']
+                        
+                        # Create key for vehicle+stop
+                        key = (vehicle, origin)
+                        
+                        # Store departure info
+                        if key not in departures:
+                            departures[key] = []
+                            
+                        departures[key].append({
+                            'time': start_time,
+                            'trip_id': i,
+                            'direction': current_trip.get('Relief Vehicle Direction', 'Unknown'),
+                            'prev_block': current_trip.get('Previous Block', ''),
+                            'prev_route': current_trip.get('Previous Route', ''),
+                            'next_block': current_trip.get('Next Block', ''),
+                            'next_route': current_trip.get('Next Route', '')
+                        })
+                    
+                    # ---- Track arrival at destination ----
                     if not pd.isna(current_trip['Destination']) and not pd.isna(current_trip['End Time']):
                         destination = current_trip['Destination']
                         end_time = current_trip['End Time']
                         
-                        # Determine how long the vehicle stays at this destination
-                        if next_trip is not None and next_trip['Origin'] == destination:
-                            # Vehicle stays until the next trip start time
-                            stay_until = next_trip['Start Time']
-                        else:
-                            # Brief stop (create a short 5-minute stop)
-                            stay_until = end_time + timedelta(minutes=5)
+                        # Create key for vehicle+stop
+                        key = (vehicle, destination)
                         
-                        # Add to the stop presence data
-                        stop_presence[destination].append({
-                            'vehicle': vehicle,
-                            'start': end_time,
-                            'end': stay_until,
-                            'direction': current_trip.get('Relief Vehicle Direction', 'Unknown')
+                        # Store arrival info
+                        if key not in arrivals:
+                            arrivals[key] = []
+                            
+                        arrivals[key].append({
+                            'time': end_time,
+                            'trip_id': i,
+                            'direction': current_trip.get('Relief Vehicle Direction', 'Unknown'),
+                            'prev_block': current_trip.get('Previous Block', ''),
+                            'prev_route': current_trip.get('Previous Route', ''),
+                            'next_block': current_trip.get('Next Block', ''),
+                            'next_route': current_trip.get('Next Route', '')
                         })
+            
+            # Now process the arrivals and departures to create stop presence records
+            for key in set(list(arrivals.keys()) + list(departures.keys())):
+                vehicle, stop = key
+                
+                vehicle_arrivals = sorted(arrivals.get(key, []), key=lambda x: x['time'])
+                vehicle_departures = sorted(departures.get(key, []), key=lambda x: x['time'])
+                
+                # Case 1: Vehicle arrives at stop and then departs later (extended stay)
+                if vehicle_arrivals and vehicle_departures:
+                    # Match arrivals with subsequent departures to create extended stays
+                    # We'll use a greedy approach - match each arrival with the next available departure
+                    
+                    # Create a copy of departures we can modify
+                    available_departures = vehicle_departures.copy()
+                    
+                    for arrival in vehicle_arrivals:
+                        arrival_time = arrival['time']
+                        arrival_trip = arrival['trip_id']
                         
-                    # Case 2: Special case for first trip of the day
-                    if i == vehicle_df.index[0]:
-                        # If the first trip starts from somewhere, the vehicle was already there
-                        origin = current_trip['Origin']
-                        start_time = current_trip['Start Time']
+                        # Find the next departure after this arrival
+                        matching_departure = None
+                        matching_idx = None
                         
-                        # Unless the origin is CATA Garage and direction is Out
-                        # (which means it started its day at the garage - normal case)
-                        if not (origin == 'CATA Garage' and current_trip.get('Relief Vehicle Direction') == 'Out'):
-                            # Add a presence that starts 15 minutes before the trip
-                            stop_presence[origin].append({
+                        for idx, departure in enumerate(available_departures):
+                            if departure['time'] >= arrival_time:
+                                # Only match if the departure is part of a different trip
+                                # This prevents matching an arrival with its own departure at the same time
+                                if departure['trip_id'] != arrival_trip or departure['time'] > arrival_time:
+                                    matching_departure = departure
+                                    matching_idx = idx
+                                    break
+                        
+                        if matching_departure:
+                            # Found a matching departure - remove it from available list
+                            del available_departures[matching_idx]
+                            
+                            # Get a unique ID for this stay
+                            stay_id = f"{arrival['trip_id']}-{matching_departure['trip_id']}"
+                            
+                            # Create a record for the stay with buffer
+                            stay_start = arrival_time - timedelta(minutes=BUFFER_MINUTES)
+                            stay_end = matching_departure['time'] + timedelta(minutes=BUFFER_MINUTES)
+                            
+                            # Check if this is an instant stay (arrival and departure at same time or very close)
+                            is_instant = (matching_departure['time'] - arrival_time).total_seconds() < 60
+                            
+                            # Add the stay record
+                            stop_presence[stop].append({
                                 'vehicle': vehicle,
-                                'start': start_time - timedelta(minutes=15),
-                                'end': start_time,
-                                'direction': 'Pre-trip'
+                                'start': stay_start,
+                                'end': stay_end,
+                                'direction': arrival['direction'],
+                                'event_type': 'Instant Stop' if is_instant else 'Extended Stay',
+                                'stay_id': stay_id,  # Unique ID for this stay
+                                'actual_arrival': arrival_time,
+                                'actual_departure': matching_departure['time'],
+                                'arrival_trip': arrival['trip_id'],
+                                'departure_trip': matching_departure['trip_id'],
+                                'prev_block': arrival['prev_block'],
+                                'prev_route': arrival['prev_route'],
+                                'next_block': matching_departure['next_block'],
+                                'next_route': matching_departure['next_route']
                             })
+                        else:
+                            # No matching departure found, just record the arrival with buffer
+                            stop_presence[stop].append({
+                                'vehicle': vehicle,
+                                'start': arrival_time - timedelta(minutes=BUFFER_MINUTES),
+                                'end': arrival_time + timedelta(minutes=BUFFER_MINUTES),
+                                'direction': arrival['direction'],
+                                'event_type': 'Arrival Only',
+                                'stay_id': f"{arrival['trip_id']}-end",
+                                'actual_arrival': arrival_time,
+                                'actual_departure': None
+                            })
+                    
+                    # Handle any remaining departures that had no matching arrival
+                    for departure in available_departures:
+                        departure_time = departure['time']
+                        
+                        stop_presence[stop].append({
+                            'vehicle': vehicle,
+                            'start': departure_time - timedelta(minutes=BUFFER_MINUTES),
+                            'end': departure_time + timedelta(minutes=BUFFER_MINUTES),
+                            'direction': departure['direction'],
+                            'event_type': 'Departure Only',
+                            'stay_id': f"start-{departure['trip_id']}",
+                            'actual_arrival': None,
+                            'actual_departure': departure_time
+                        })
+                
+                # Case 2: Only arrivals, no departures
+                elif vehicle_arrivals:
+                    for arrival in vehicle_arrivals:
+                        arrival_time = arrival['time']
+                        
+                        stop_presence[stop].append({
+                            'vehicle': vehicle,
+                            'start': arrival_time - timedelta(minutes=BUFFER_MINUTES),
+                            'end': arrival_time + timedelta(minutes=BUFFER_MINUTES),
+                            'direction': arrival['direction'],
+                            'event_type': 'Arrival Only',
+                            'stay_id': f"{arrival['trip_id']}-end",
+                            'actual_arrival': arrival_time,
+                            'actual_departure': None
+                        })
+                
+                # Case 3: Only departures, no arrivals
+                elif vehicle_departures:
+                    for departure in vehicle_departures:
+                        departure_time = departure['time']
+                        
+                        stop_presence[stop].append({
+                            'vehicle': vehicle,
+                            'start': departure_time - timedelta(minutes=BUFFER_MINUTES),
+                            'end': departure_time + timedelta(minutes=BUFFER_MINUTES),
+                            'direction': departure['direction'],
+                            'event_type': 'Departure Only',
+                            'stay_id': f"start-{departure['trip_id']}",
+                            'actual_arrival': None,
+                            'actual_departure': departure_time
+                        })
             
             # Create dropdown for stops instead of tabs
             if all_stops:
@@ -207,27 +343,58 @@ if uploaded_file is not None:
                     # Create figure
                     fig = go.Figure()
                     
-                    # Filter out duplicate entries before processing
-                    # A duplicate is defined as the same vehicle at the same stop with the same start and end times
-                    filtered_timeline_data = []
-                    seen_entries = set()  # Track unique vehicle+time combinations
+                    # Merge overlapping time blocks for the same vehicle
+                    # First, sort by vehicle and start time
+                    timeline_data = sorted(stop_presence[stop], key=lambda x: (x['vehicle'], x['start']))
                     
-                    for entry in stop_presence[stop]:
-                        if entry['start'] is not None and entry['end'] is not None:
-                            # Create a unique key for this entry
-                            entry_key = (
-                                entry['vehicle'],
-                                entry['start'].strftime("%Y-%m-%d %H:%M"),
-                                entry['end'].strftime("%Y-%m-%d %H:%M")
-                            )
+                    # We'll be more careful about merging - only merge entries with the same stay_id
+                    merged_timeline = []
+                    current_block = None
+                    
+                    for entry in timeline_data:
+                        if entry['start'] is None or entry['end'] is None:
+                            continue
                             
-                            # Only add this entry if we haven't seen it before
-                            if entry_key not in seen_entries:
-                                seen_entries.add(entry_key)
-                                filtered_timeline_data.append(entry)
+                        if current_block is None:
+                            current_block = entry.copy()
+                        elif (current_block['vehicle'] == entry['vehicle'] and
+                              entry['start'] <= current_block['end'] and 
+                              current_block.get('stay_id') == entry.get('stay_id')):
+                            # Blocks overlap AND belong to the same stay - extend current block
+                            current_block['end'] = max(current_block['end'], entry['end'])
+                        else:
+                            # Different stay or no overlap - add the current block and start a new one
+                            merged_timeline.append(current_block)
+                            current_block = entry.copy()
                     
-                    # Replace the original timeline data with the filtered version
-                    timeline_data = filtered_timeline_data
+                    # Add the last block if any
+                    if current_block is not None:
+                        merged_timeline.append(current_block)
+                    
+                    # Use the merged timeline data for the chart
+                    timeline_data = merged_timeline
+                    
+                    # Debug output for troubleshooting (hidden in collapsed section)
+                    with st.expander("Debug Timeline Data"):
+                        debug_data = []
+                        for entry in timeline_data:
+                            debug_entry = {
+                                'Vehicle': entry['vehicle'],
+                                'Start': entry['start'].strftime("%H:%M:%S"),
+                                'End': entry['end'].strftime("%H:%M:%S"),
+                                'Duration (min)': round((entry['end'] - entry['start']).total_seconds() / 60, 1),
+                                'Type': entry.get('event_type', 'Unknown'),
+                                'Stay ID': entry.get('stay_id', 'Unknown')
+                            }
+                            
+                            # Add actual arrival/departure times if available
+                            if 'actual_arrival' in entry and entry['actual_arrival'] is not None:
+                                debug_entry['Actual Arrival'] = entry['actual_arrival'].strftime("%H:%M:%S")
+                            if 'actual_departure' in entry and entry['actual_departure'] is not None:
+                                debug_entry['Actual Departure'] = entry['actual_departure'].strftime("%H:%M:%S")
+                                
+                            debug_data.append(debug_entry)
+                        st.dataframe(debug_data)
                     
                     # Sort timeline data by start time
                     timeline_data.sort(key=lambda x: x['start'])
@@ -241,7 +408,7 @@ if uploaded_file is not None:
                         # Default if no data
                         zoom_start = datetime.combine(base_date, datetime.min.time()).replace(hour=8)
                         zoom_end = datetime.combine(base_date, datetime.min.time()).replace(hour=10)
-
+                    
                     # Simple approach: assign rows purely based on time overlap
                     # This guarantees that a vehicle will always be placed in the lowest free row
                     
@@ -305,13 +472,25 @@ if uploaded_file is not None:
                         start_time_str = start_time.strftime("%H:%M")
                         end_time_str = end_time.strftime("%H:%M")
                         
-                        # Track duration for this vehicle (we'll use the max duration for the legend)
-                        if vehicle not in vehicle_durations:
-                            vehicle_durations[vehicle] = duration
-                        else:
-                            vehicle_durations[vehicle] = max(vehicle_durations[vehicle], duration)
+                        # Get more descriptive information for the hover text
+                        event_type = entry.get('event_type', 'Unknown')
                         
-                        # Add rectangle without any text or hover
+                        # Prepare the hover text with detailed information
+                        hover_text = f"{vehicle} ({event_type})<br>"
+                        hover_text += f"Display Time: {start_time_str} to {end_time_str} ({int(duration)} min)<br>"
+                        
+                        if 'actual_arrival' in entry and entry['actual_arrival'] is not None:
+                            hover_text += f"Actual Arrival: {entry['actual_arrival'].strftime('%H:%M:%S')}<br>"
+                        if 'actual_departure' in entry and entry['actual_departure'] is not None:
+                            hover_text += f"Actual Departure: {entry['actual_departure'].strftime('%H:%M:%S')}<br>"
+                            
+                        # Add route information if available
+                        if 'prev_route' in entry and entry['prev_route']:
+                            hover_text += f"Previous Route: {entry['prev_route']}<br>"
+                        if 'next_route' in entry and entry['next_route']:
+                            hover_text += f"Next Route: {entry['next_route']}<br>"
+                        
+                        # Add rectangle with hover information
                         fig.add_trace(go.Scatter(
                             x=[start_time, end_time, end_time, start_time, start_time],
                             y=[y_pos, y_pos, y_pos+1, y_pos+1, y_pos],
@@ -319,7 +498,9 @@ if uploaded_file is not None:
                             fillcolor=vehicle_colors[vehicle],
                             line=dict(color=vehicle_colors[vehicle], width=1),
                             mode="lines",
-                            name=f"{vehicle}: {int(duration)} min ({start_time_str} to {end_time_str})",  # Include duration and time range
+                            name=f"{vehicle}: {int(duration)} min ({start_time_str} to {end_time_str})",
+                            hoverinfo="text",
+                            hovertext=hover_text,
                             showlegend=(vehicle not in added_vehicles)
                         ))
                         
